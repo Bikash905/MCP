@@ -1,4 +1,4 @@
-CREATE OR REPLACE PROCEDURE NAABO_DEV.RR_REPORTING_WRITEBACK.SP_GENERATE_ROPES_REPAIR()
+CREATE OR REPLACE PROCEDURE NAABO_PROD.RR_REPORTING_WRITEBACK.SP_GENERATE_ROPES_REPAIR()
 RETURNS VARCHAR
 LANGUAGE PYTHON
 RUNTIME_VERSION = '3.10'
@@ -904,8 +904,9 @@ def _sql_escape(value) -> str:
     return str(value).replace("''", "''''")
 
 def run(session) -> list:
+
     global LOGO_READER
-    LOGO_READER = _get_logo_from_stage(session)  # ensure header has the logo
+    LOGO_READER = _get_logo_from_stage(session)
 
     results = []
 
@@ -914,20 +915,20 @@ def run(session) -> list:
     # -------------------------------------------------------------------------
     filter_query = """
     SELECT DISTINCT
-      RUUOMBMEUC AS buildingnumber,
-      F3K6VIU7YN AS machinenumber,
-      QOOTIFJBV2 AS FACT_TYPE,
-      DATE(A5Y8GN9GFO) AS WORKDATE,
-      DATE(MJTGEEFAFZ) AS start_date,
-      DATE(AR5PXL_LHJ) AS end_date,
+      FJN8DAASBE AS buildingnumber,
+      VEMLQJYEMK AS machinenumber,
+      "P8WPA9LA-8" AS FACT_TYPE,
+      DATE("X-7ZWJH4OP") AS WORKDATE,
+      DATE("2KYI06E7B4") AS start_date,
+      DATE(OVIHUR3NFB) AS end_date,
       UPDATED_BY,
       r.reqlegalid
-    FROM NAABO_DEV.RR_REPORTING_WRITEBACK."SIGDS_27259cad_15b0_46b3_8984_7ce243a6ef0e" s
-    LEFT JOIN NAABO_DEV.RR_REPORTING.REQUESTORS r
+    FROM NAABO_PROD.RR_REPORTING_WRITEBACK."SIGDS_5e849ae5_b19a_4410_b193_dd5840accd29" s
+    LEFT JOIN NAABO_PROD.RR_REPORTING.REQUESTORS r
       ON UPPER(s.UPDATED_BY) = UPPER(r.requserid)
     WHERE UPDATED_AT = (
       SELECT MAX(UPDATED_AT)
-      FROM NAABO_DEV.RR_REPORTING_WRITEBACK."SIGDS_27259cad_15b0_46b3_8984_7ce243a6ef0e")
+      FROM NAABO_PROD.RR_REPORTING_WRITEBACK."SIGDS_5e849ae5_b19a_4410_b193_dd5840accd29")
     ORDER BY WORKDATE;
     """
     filter_df = session.sql(filter_query).to_pandas()
@@ -935,110 +936,103 @@ def run(session) -> list:
     # scratch temp table (as in your original)
     session.sql("""
         CREATE OR REPLACE TEMP TABLE DATA_READ AS
-        SELECT * FROM NAABO_DEV.RR_REPORTING_WRITEBACK.ROPES_N_REPAIR_STREAM WHERE 0=1
+        SELECT * FROM NAABO_PROD.RR_REPORTING_WRITEBACK.ROPES_N_REPAIR_STREAM WHERE 0=1
     """).collect()
 
     if filter_df.empty:
-        return ["No filter rows found in TABLE_NAME_EXTRACT_TESTING for current requestors."]
+        return ["No filter rows found for current requestors."]
 
-    # Normalize & validate columns (UPPERCASE expected from Snowflake)
+    # Normalize & validate columns
     filter_df.columns = [c.strip().upper() for c in filter_df.columns]
-    required_cols = {"BUILDINGNUMBER", "MACHINENUMBER", "FACT_TYPE",
-                     "START_DATE", "END_DATE", "UPDATED_BY", "REQLEGALID"}
+    required_cols = {
+        "BUILDINGNUMBER", "MACHINENUMBER", "FACT_TYPE",
+        "WORKDATE", "START_DATE", "END_DATE", "UPDATED_BY", "REQLEGALID"
+    }
     missing = required_cols - set(filter_df.columns)
     if missing:
         raise ValueError(f"Missing required columns in filter_df: {sorted(missing)}")
 
-    # Overall date range (for constant display fields)
-    static_start_date = filter_df["START_DATE"].min()
-    static_end_date   = filter_df["END_DATE"].max()
-    start_range = static_start_date.strftime("%Y-%m-%d") if pd.notnull(static_start_date) else ""
-    end_range   = static_end_date.strftime("%Y-%m-%d") if pd.notnull(static_end_date) else ""
-
-    # Use first UPDATED_BY as recipient (keep behavior)
+    # recipient
     rec = filter_df["UPDATED_BY"].iloc[0] if not filter_df.empty else "Unknown"
 
-    # Clean types / parse dates
+    # Clean / normalize
     filter_df["BUILDINGNUMBER"] = filter_df["BUILDINGNUMBER"].astype(str).str.strip()
     filter_df["MACHINENUMBER"]  = filter_df["MACHINENUMBER"].astype(str).str.strip()
+    filter_df["FACT_TYPE"]      = filter_df["FACT_TYPE"].astype(str).str.strip()
     filter_df["REQLEGALID"]     = filter_df["REQLEGALID"].astype(str).str.strip()
-    filter_df["START_DATE"]     = pd.to_datetime(filter_df["START_DATE"], errors="coerce")
-    filter_df["END_DATE"]       = pd.to_datetime(filter_df["END_DATE"], errors="coerce")
 
-    # Drop rows with invalid essential values
-    filter_df = filter_df.dropna(subset=[
-        "BUILDINGNUMBER", "MACHINENUMBER", "FACT_TYPE", "START_DATE", "END_DATE", "REQLEGALID"
-    ])
+    filter_df["WORKDATE"]   = pd.to_datetime(filter_df["WORKDATE"], errors="coerce").dt.date
+    filter_df["START_DATE"] = pd.to_datetime(filter_df["START_DATE"], errors="coerce")
+    filter_df["END_DATE"]   = pd.to_datetime(filter_df["END_DATE"], errors="coerce")
+
+    filter_df = filter_df.dropna(subset=["BUILDINGNUMBER","MACHINENUMBER","FACT_TYPE","WORKDATE","REQLEGALID"])
     if filter_df.empty:
-        return ["All filter rows had missing/invalid building/machine/start/end/reqlegalid."]
+        return ["All filter rows had missing/invalid building/machine/fact/workdate/reqlegalid."]
 
-    # -------------------------------------------------------------------------
-    # 2) Iterate per BUILDINGNUMBER -> fetch & union data -> one PDF per building
-    # -------------------------------------------------------------------------
+    # Overall date range (display fields)
+    start_range = filter_df["START_DATE"].min().strftime("%Y-%m-%d") if pd.notnull(filter_df["START_DATE"].min()) else ""
+    end_range   = filter_df["END_DATE"].max().strftime("%Y-%m-%d") if pd.notnull(filter_df["END_DATE"].max()) else ""
+
     pagesize = landscape(A3)
     page_w, page_h = pagesize
 
+    # -------------------------------------------------------------------------
+    # 2) One PDF per BUILDING
+    # -------------------------------------------------------------------------
     for bn, bn_group in filter_df.groupby("BUILDINGNUMBER"):
-        combined_df_list = []
-        min_start = None
-        max_end   = None
+        bn_group = bn_group.copy()
 
-        for _, frow in bn_group.iterrows():
-            mn    = frow["MACHINENUMBER"]
-            reqid = frow["REQLEGALID"]
-            fc    = frow["FACT_TYPE"]
+        # Debug: machines requested for this building
+        results.append(f"[INFO] building={bn} machines_in_filter={bn_group[''MACHINENUMBER''].nunique()}")
 
-            # Window dates
-            wcd_start = frow["START_DATE"]
-            wcd_end   = frow["END_DATE"]
-            dat=frow["WORKDATE"]
-            wcd_start_str = wcd_start.strftime("%Y-%m-%d")
-            wcd_end_str   = wcd_end.strftime("%Y-%m-%d")
-            dt= dat.strftime("%Y-%m-%d")
+        # -------------------------------------------------------------
+        # A) Push building filter rows into a TEMP table (JOIN approach)
+        # -------------------------------------------------------------
+        # Keep only join columns needed + reqlegalid for trace
+        bn_group_small = bn_group[["BUILDINGNUMBER","MACHINENUMBER","FACT_TYPE","WORKDATE","REQLEGALID"]].drop_duplicates()
 
-            # Update building-level coverage
-            if (min_start is None) or (wcd_start < min_start):
-                min_start = wcd_start
-            if (max_end is None) or (wcd_end > max_end):
-                max_end = wcd_end
+        # Create a unique temp table name per building (safe)
+        tmp_filters = f"TEMP_FILTERS_{str(bn)}"
+        session.create_dataframe(bn_group_small).write.save_as_table(
+            tmp_filters,
+            mode="overwrite",
+            table_type="temporary"
+        )
 
-            # Fetch fact rows for this window
-            query = f"""
-            SELECT *
-            FROM NAABO_DEV.RR_REPORTING.FACT_DIM_ROPES_REPAIR
-            WHERE MACHINENUMBER = ''{_sql_escape(mn)}''
-              AND BUILDINGNUMBER = ''{_sql_escape(bn)}''
-              AND FACTTYPE = ''{_sql_escape(fc)}''
-              AND WORKCOMPLETIONDATE = ''{_sql_escape(dt)}'' 
-              order by workcompletiondate
-            """
-            main_df = session.sql(query).to_pandas()
-            if main_df.empty:
-                continue
+        # -------------------------------------------------------------
+        # B) Single query to fetch ALL fact rows for ALL machines
+        # -------------------------------------------------------------
+        # Robust join using TRIM/TO_VARCHAR and TO_DATE for completion date
+        fact_query = f"""
+        SELECT
+            f.*,
+            ''{_sql_escape(start_range)}'' AS START_DATE,
+            ''{_sql_escape(end_range)}''   AS END_DATE,
+            t.REQLEGALID
+        FROM NAABO_PROD.RR_REPORTING.FACT_DIM_ROPES_REPAIR f
+        JOIN {tmp_filters} t
+          ON TRIM(TO_VARCHAR(f.BUILDINGNUMBER)) = TRIM(TO_VARCHAR(t.BUILDINGNUMBER))
+         AND TRIM(TO_VARCHAR(f.MACHINENUMBER))  = TRIM(TO_VARCHAR(t.MACHINENUMBER))
+         AND TRIM(f.FACTTYPE)                   = TRIM(t.FACT_TYPE)
+         AND TO_DATE(f.WORKCOMPLETIONDATE)      = TO_DATE(t.WORKDATE)
+        ORDER BY
+            TO_DATE(f.WORKCOMPLETIONDATE)
+        """
+        RR_DF = session.sql(fact_query).to_pandas()
 
-            main_df.columns = [c.strip() for c in main_df.columns]
-
-            # Carry these as static/context fields in the output (display/traceback)
-            main_df["START_DATE"] = start_range
-            main_df["END_DATE"]   = end_range
-            main_df["REQLEGALID"] = reqid
-
-            combined_df_list.append(main_df)
-
-        if not combined_df_list:
-            results.append(f"[SKIP] No rows found for building={bn} across all filter rows.")
+        if RR_DF.empty:
+            results.append(f"[SKIP] No fact rows matched for building={bn}.")
             continue
 
-        # Union all & normalize
-        RR_DF = pd.concat(combined_df_list, ignore_index=True)
         RR_DF.columns = [c.strip().upper() for c in RR_DF.columns]
 
-        # ---------------------------------------------------------------------
-        # 3) Build a single PDF for the building with CHRONOLOGICAL pages
-        # ---------------------------------------------------------------------
-        min_start_str = min_start.strftime("%Y-%m-%d") if isinstance(min_start, pd.Timestamp) else str(min_start)
-        max_end_str   = max_end.strftime("%Y-%m-%d")   if isinstance(max_end, pd.Timestamp) else str(max_end)
+        # Debug: machines actually returned
+        if "MACHINENUMBER" in RR_DF.columns:
+            results.append(f"[INFO] building={bn} machines_in_RR_DF={RR_DF[''MACHINENUMBER''].astype(str).str.strip().nunique()}")
 
+        # -------------------------------------------------------------
+        # C) Build ONE PDF for the building from RR_DF
+        # -------------------------------------------------------------
         safe_bn  = str(bn).replace(''/'', ''_'').replace(''\\\\'', ''_'').strip()
         out_file = f"Rope_&_Repair_{safe_bn}.pdf"
 
@@ -1052,7 +1046,6 @@ def run(session) -> list:
             bottomMargin=30
         )
 
-        # Frames & templates
         default_frame = Frame(
             doc.leftMargin,
             doc.bottomMargin,
@@ -1060,9 +1053,12 @@ def run(session) -> list:
             page_h - doc.topMargin - doc.bottomMargin,
             id="default"
         )
-        blank_frame = Frame(0, 0, page_w, page_h,
-                            leftPadding=0, rightPadding=0,
-                            topPadding=0, bottomPadding=0, id="BlankFull")
+        blank_frame = Frame(
+            0, 0, page_w, page_h,
+            leftPadding=0, rightPadding=0,
+            topPadding=0, bottomPadding=0,
+            id="BlankFull"
+        )
         frame_h = page_h - doc.topMargin - doc.bottomMargin
 
         start_tpl   = PageTemplate(id="Start",   frames=blank_frame,   onPage=draw_report_start)
@@ -1071,33 +1067,34 @@ def run(session) -> list:
         doc.addPageTemplates([start_tpl, default_tpl, end_tpl])
 
         elements = []
-        # Start on a blank START page, then switch to Default
         elements.append(NextPageTemplate("Default"))
         elements.append(PageBreak())
 
-        # -------- CHRONOLOGICAL pages (Callbacks / Procedures / Repairs mixed) --------
+        # -------- CHRONOLOGICAL sort --------
         def _parse_dt(row):
-            """Compose a sortable timestamp from WORKCOMPLETIONDATE (+optional time)."""
-            dt = row.get("WORKCOMPLETIONDATE")
-            tm = row.get("WORKCOMPLETIONTIME")
+            dtv = row.get("WORKCOMPLETIONDATE")
+            tm  = row.get("WORKCOMPLETIONTIME")
             try:
-                if pd.notnull(dt) and pd.notnull(tm):
-                    return pd.to_datetime(str(dt).split(" ")[0] + " " + str(tm), errors="ignore", utc=False)
-                return pd.to_datetime(dt, errors="coerce")
+                if pd.notnull(dtv) and pd.notnull(tm):
+                    return pd.to_datetime(str(dtv).split(" ")[0] + " " + str(tm), errors="coerce")
+                return pd.to_datetime(dtv, errors="coerce")
             except Exception:
                 return pd.NaT
 
-        # stable chronological order (mergesort keeps relative order for ties)
         RR_DF["_SORT_DT"] = RR_DF.apply(_parse_dt, axis=1)
         RR_DF["_SORT_DT"] = RR_DF["_SORT_DT"].fillna(pd.Timestamp.max)
 
-        # De-dup helpers
-        seen_td_keys  = set()  # callbacks
-        seen_proc_keys = set()
-        seen_rep_keys  = set()
+        ordered = RR_DF.sort_values(["_SORT_DT", "FACTTYPE", "MACHINENUMBER"], kind="mergesort").reset_index(drop=True)
+        has_td_col = "TD_KEY" in RR_DF.columns
+
+        # -------------------------------------------------------------
+        # DEDUP: make callbacks dedup machine-safe
+        # -------------------------------------------------------------
+        seen_td_keys     = set()   # store (machinenumber, td_key)
+        seen_proc_keys   = set()
+        seen_rep_keys    = set()
 
         def _proc_key(r):
-            # Adjust subset to your business identity (add/remove fields as needed)
             return (
                 r.get("BUILDINGNUMBER"),
                 r.get("MACHINENUMBER"),
@@ -1107,7 +1104,6 @@ def run(session) -> list:
             )
 
         def _rep_key(r):
-            # Adjust subset to your business identity (add/remove fields as needed)
             return (
                 r.get("BUILDINGNUMBER"),
                 r.get("MACHINENUMBER"),
@@ -1116,14 +1112,10 @@ def run(session) -> list:
                 r.get("UNIQUE_ID")
             )
 
-        ordered = RR_DF.sort_values(["_SORT_DT", "FACTTYPE"], kind="mergesort").reset_index(drop=True)
-        has_td_col = "TD_KEY" in RR_DF.columns
-
         for _, rr_row in ordered.iterrows():
             fact = rr_row.get("FACTTYPE")
 
             if fact == "Callbacks":
-                # If no TD_KEY column/value, render a minimal callbacks page for this row
                 if not has_td_col:
                     section_rows = make_section_rows(rr_row)
                     payload = {**rr_row.to_dict(), "_SECTION_ROWS": section_rows}
@@ -1134,51 +1126,55 @@ def run(session) -> list:
                 td_key_val = rr_row.get("TD_KEY")
                 if isinstance(td_key_val, str):
                     td_key_val = td_key_val.strip()
+
                 if not td_key_val or str(td_key_val).lower() == "nan":
-                    # No usable key -> render minimal page from this single row
                     section_rows = make_section_rows(rr_row)
                     payload = {**rr_row.to_dict(), "_SECTION_ROWS": section_rows}
                     elements += build_page_elements(payload, [], [], page_w, doc, COL_GAP, ROW_GAP)
                     elements.append(PageBreak())
                     continue
 
-                # Render this TD_KEY once at the time it first appears
-                if td_key_val in seen_td_keys:
-                    continue
-                seen_td_keys.add(td_key_val)
+                mn_val = str(rr_row.get("MACHINENUMBER")).strip()
+                td_key_key = (mn_val, td_key_val)
 
-                rr_cb = RR_DF[RR_DF["TD_KEY"] == td_key_val].copy()
-                
+                if td_key_key in seen_td_keys:
+                    continue
+                seen_td_keys.add(td_key_key)
+
+                # Only rows for this same machine + td_key
+                rr_cb = RR_DF[
+                    (RR_DF.get("TD_KEY") == td_key_val) &
+                    (RR_DF.get("MACHINENUMBER").astype(str).str.strip() == mn_val)
+                ].copy()
+
                 for _, cb_row in rr_cb.iterrows():
-                    rr_cb_row = cb_row
-                    section_rows = make_section_rows(rr_cb_row)
-                    rr_cb_row_dict = rr_cb_row.to_dict()
-    
-                    # Pull DIM_DESCRIPTION for events under this TD_KEY
+                    section_rows = make_section_rows(cb_row)
+                    cb_dict = cb_row.to_dict()
+
                     desc_sql = f"""
                     SELECT TD_KEY, TD_PARTDESC, VDATE, VPARTTIME, ''EST'' AS "TIME ZONE"
-                    FROM NAABO_DEV.RR_REPORTING.DIM_DESCRIPTION
+                    FROM NAABO_PROD.RR_REPORTING.DIM_DESCRIPTION
                     WHERE TD_KEY = ''{_sql_escape(td_key_val)}'' AND VPARTTIME IS NOT NULL
-    ORDER BY
-        TO_DATE(
-            CASE
-                WHEN LENGTH(VDATE) = 5 THEN VDATE || ''-'' || YEAR(CURRENT_DATE)
-                ELSE VDATE
-            END,
-            ''MM-DD-YYYY''
-        ),
-        TO_TIME(VPARTTIME, ''HH12:MI AM'');
+                    ORDER BY
+                        TO_DATE(
+                            CASE
+                                WHEN LENGTH(VDATE) = 5 THEN VDATE || ''-'' || YEAR(CURRENT_DATE)
+                                ELSE VDATE
+                            END,
+                            ''MM-DD-YYYY''
+                        ),
+                        TO_TIME(VPARTTIME, ''HH12:MI AM'');
                     """
                     TD_DIM_DESCRIPTION = session.sql(desc_sql).to_pandas()
                     if not TD_DIM_DESCRIPTION.empty and "TD_KEY" in TD_DIM_DESCRIPTION.columns:
                         events_rows = TD_DIM_DESCRIPTION.drop(columns=["TD_KEY"]).values.tolist()
                     else:
                         events_rows = TD_DIM_DESCRIPTION.values.tolist() if not TD_DIM_DESCRIPTION.empty else []
-    
-                    payload = {**rr_cb_row_dict, "_SECTION_ROWS": section_rows}
+
+                    payload = {**cb_dict, "_SECTION_ROWS": section_rows}
                     elements += build_page_elements(payload, [], events_rows, page_w, doc, COL_GAP, ROW_GAP)
                     elements.append(PageBreak())
-    
+
             elif fact == "Procedures":
                 k = _proc_key(rr_row)
                 if k in seen_proc_keys:
@@ -1189,7 +1185,7 @@ def run(session) -> list:
                 payload = {**rr_row.to_dict(), "_SECTION_ROWS": section_rows}
                 elements += build_page_elements(payload, [], [], page_w, doc, COL_GAP, ROW_GAP)
                 elements.append(PageBreak())
-                
+
             elif fact == "Repairs":
                 k = _rep_key(rr_row)
                 if k in seen_rep_keys:
@@ -1202,26 +1198,26 @@ def run(session) -> list:
                 elements.append(PageBreak())
 
             else:
-                # Unknown FACTTYPE — skip or log if needed
                 continue
 
-        # Clean helper column
-        if "_SORT_DT" in RR_DF.columns:
-            RR_DF.drop(columns=["_SORT_DT"], inplace=True, errors="ignore")
+        RR_DF.drop(columns=["_SORT_DT"], inplace=True, errors="ignore")
 
-        # -------- End page --------
+        # End page
         if len(elements) and isinstance(elements[-1], PageBreak):
             elements = elements[:-1]
+
         elements.append(NextPageTemplate("End"))
         elements += build_center_page_elements("", frame_h)
         elements.append(PageBreak())
 
-        # Build & upload
+        # Build & upload once per building
         doc.build(elements, canvasmaker=NumberedCanvas)
         pdf_data = buffer.getvalue()
         buffer.close()
 
         _upload_pdf_to_stage(session, out_file, pdf_data)
+
+    # Email once
     send_email(session, rec)
 
     return "PDF(s) generated, uploaded to stage and sent mail to recipient."
